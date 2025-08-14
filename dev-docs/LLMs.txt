@@ -1,0 +1,196 @@
+BEANCOUNT-TO-SQL DATABASE SCHEMA & FINANCIAL ANALYSIS GUIDE FOR LLMs
+================================================================
+
+PURPOSE: Guide LLMs to analyze financial data from beancount files stored in PostgreSQL.
+Generate SQL queries from natural language prompts and interpret results.
+
+DATABASE SCHEMA OVERVIEW
+========================
+
+Core Tables:
+- accounts: Chart of accounts (Assets, Liabilities, Income, Expenses, Equity)
+- transactions: Individual financial transactions 
+- postings: Journal entries (debits/credits) within each transaction
+- commodities: Currencies and securities (USD, INR, stocks)
+- tags/links: Transaction categorization and linking
+- balance_assertions: Account balance checkpoints
+- prices: Historical market data
+
+Key Relationships:
+- transactions.id → postings.transaction_id (1:many)
+- accounts.id → postings.account_id (1:many) 
+- commodities.id → postings.currency_id (1:many)
+
+ACCOUNT STRUCTURE & SEMANTIC MEANING
+====================================
+
+INCOME ACCOUNTS (Credit increases):
+- Income:Salary:Net: Take-home pay after deductions (NET)
+- Income:CreditCard:Rewards: Cash back rewards (NET)  
+- Income:Bonus: Employment bonuses (GROSS)
+- Income:Other: Miscellaneous income (GROSS)
+- Income:Interest:*: Interest from banks/investments (GROSS)
+- Income:Reimbursements:*: Expense reimbursements (NET)
+- Income:Gifts: Gift income (NET)
+
+EXPENSE ACCOUNTS (Debit increases):
+Major Categories:
+- Expenses:AutoInsurance: Car insurance
+- Expenses:Internet: Internet connection costs
+- Expenses:Phone: Phone costs
+- Expenses:CloudServices: Costs related to various cloud services
+- Expenses:HouseCleaning: Costs for getting the house professionally cleaned
+- Expenses:Hobbies: Costs incurred by various hobbies
+- Expenses:PersonalItems: Personal items
+- Expenses:HouseholdItems: Household items
+- Expenses:Cash: Cash withdrawal. Cash expenses are not tracked further.
+- Expenses:Donations: Donations
+- Expenses:Gifts: Gifts
+- Expenses:Miscellaneous: Expenses that have no clear category
+- Expenses:Gadgets: Money spent on gadgets
+- Expenses:Parking: Parking fees
+- Expenses:Grooming: Personal grooming. Haircuts, waxing etc.
+- Expenses:School: school related expenses
+- Expenses:HouseRent: Housing costs
+- Expenses:Groceries: Food shopping
+- Expenses:EatingOut: Restaurant meals
+- Expenses:Gas: Vehicle fuel
+- Expenses:Travel: Trip expenses
+- Expenses:Entertainment: Recreation
+- Expenses:Healthcare: Medical costs
+- Expenses:Utilities: Electric/water/etc
+- Expenses:Insurance:*: Insurance premiums
+- Expenses:Car:*: Vehicle expenses
+- Expenses:Fees:*: Banking/service fees
+
+EQUITY/TAX ACCOUNTS:
+- Equity:Taxes:Federal: Federal tax deductions from paychecks
+- Equity:Taxes:State: State tax deductions from paychecks
+
+ASSET ACCOUNTS (Debit increases):
+- Assets:*:Checking: Bank checking accounts
+- Assets:*:Savings: Bank savings accounts  
+- Assets:*:CD: Certificate of deposits
+- Assets:ETrade: Investment account
+- Assets:Betterment: Robo-advisor account
+
+LIABILITY ACCOUNTS (Credit increases):
+- Liabilities:*:CreditCard: Credit card balances
+
+FINANCIAL CALCULATIONS
+======================
+
+1. NET INCOME (Annual):
+   NET INCOME = (Income:Salary:Net + Income:CreditCard:Rewards + Income:Other + 
+                 Income:Interest:* + Income:Bonus + Income:Reimbursements:* + Income:Gifts)
+                - (Equity:Taxes:Federal + Equity:Taxes:State)
+
+2. GROSS INCOME (Annual):
+   Sum all Income:* accounts + Equity:Taxes:* accounts
+
+3. TOTAL EXPENSES (Annual):
+   Sum all Expenses:* accounts
+
+4. EXPENSES BY CATEGORY:
+   Group by account name prefix (e.g., Expenses:Car:* = car expenses)
+
+5. SAVINGS:
+   SAVINGS = NET INCOME - TOTAL EXPENSES
+
+6. SAVINGS RATES:
+   - vs Net Income: (SAVINGS / NET INCOME) * 100
+   - vs Net Salary: (SAVINGS / Income:Salary:Net) * 100
+
+SQL QUERY PATTERNS
+==================
+
+Account Balance (specific account):
+```sql
+SELECT SUM(p.amount) as balance
+FROM postings p
+JOIN accounts a ON p.account_id = a.id  
+WHERE a.name = 'Assets:BofA:Checking'
+AND p.currency_id = (SELECT id FROM commodities WHERE name = 'USD');
+```
+
+Total Income (year):
+```sql
+SELECT SUM(p.amount) as total_income
+FROM postings p
+JOIN accounts a ON p.account_id = a.id
+JOIN transactions t ON p.transaction_id = t.id
+WHERE a.type = 'Income' 
+AND EXTRACT(year FROM t.date) = 2024
+AND p.currency_id = (SELECT id FROM commodities WHERE name = 'USD');
+```
+
+Expenses by Category (year):
+```sql
+SELECT 
+  CASE 
+    WHEN a.name LIKE 'Expenses:Car%' THEN 'Car'
+    WHEN a.name LIKE 'Expenses:Food%' OR a.name IN ('Expenses:Groceries', 'Expenses:EatingOut') THEN 'Food'
+    WHEN a.name = 'Expenses:HouseRent' THEN 'Housing'
+    ELSE SPLIT_PART(a.name, ':', 2)
+  END as category,
+  SUM(p.amount) as total
+FROM postings p
+JOIN accounts a ON p.account_id = a.id
+JOIN transactions t ON p.transaction_id = t.id  
+WHERE a.type = 'Expenses'
+AND EXTRACT(year FROM t.date) = 2024
+GROUP BY category
+ORDER BY total DESC;
+```
+
+Net Income Calculation (year):
+```sql
+WITH income_total AS (
+  SELECT SUM(p.amount) as income
+  FROM postings p
+  JOIN accounts a ON p.account_id = a.id
+  JOIN transactions t ON p.transaction_id = t.id
+  WHERE a.type = 'Income' 
+  AND EXTRACT(year FROM t.date) = 2024
+),
+tax_total AS (
+  SELECT SUM(p.amount) as taxes
+  FROM postings p  
+  JOIN accounts a ON p.account_id = a.id
+  JOIN transactions t ON p.transaction_id = t.id
+  WHERE a.name IN ('Equity:Taxes:Federal', 'Equity:Taxes:State')
+  AND EXTRACT(year FROM t.date) = 2024
+)
+SELECT (i.income - t.taxes) as net_income
+FROM income_total i, tax_total t;
+```
+
+IMPORTANT NOTES
+===============
+- Beancount uses double-entry accounting: every transaction has balanced debits/credits
+- Amounts are stored as signed numbers following accounting conventions:
+  * Income accounts: negative amounts = money earned
+  * Expense accounts: positive amounts = money spent  
+  * Asset accounts: positive amounts = money owned
+  * Liability accounts: negative amounts = money owed
+- Always filter by currency (usually USD) unless analyzing multi-currency data
+- Use absolute values when displaying amounts to users: ABS(amount)
+- For time periods, filter by transactions.date, not postings
+- Account names use colon hierarchy: Expenses:Car:Lease is under Expenses:Car
+
+COMMON USER QUERIES & RESPONSES
+===============================
+"How much did I spend on groceries last year?" 
+→ Sum Expenses:Groceries for previous year
+
+"What's my net income this year?"
+→ Calculate using NET INCOME formula above
+
+"Show me my top expense categories" 
+→ Group expenses by category, order by total DESC
+
+"What's my savings rate?"
+→ Calculate SAVINGS / NET INCOME * 100
+
+"How much do I have in savings accounts?"
+→ Sum all Assets:*:Savings account balances

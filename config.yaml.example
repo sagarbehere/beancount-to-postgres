@@ -1,0 +1,42 @@
+# Example configuration file for beancount-to-sql import script
+# Copy this file to config.yaml and modify the values as needed
+
+# ---------------------------------
+# Database Connection Configuration
+# ---------------------------------
+# Details for the 'beancount_loader' user, which will run the import.
+database:
+  host: "127.0.0.1"
+  port: 5432
+  dbname: "beancount"
+  user: "beancount_loader"
+  password: "change-me"
+
+# ---------------------------------
+# Import Behavior Configuration
+# ---------------------------------
+import_settings:
+  # What to do when a transaction with a duplicate 'external_id' is found.
+  # Options: 'skip' (default) or 'update'.
+  on_duplicate: skip
+  
+  # Number of transactions to process in each chunk for progress tracking
+  # and partial commit capability. Larger chunks = faster processing,
+  # smaller chunks = more granular progress and better resume capability.
+  chunk_size: 500
+
+# ---------------------------------
+# Logging Configuration
+# ---------------------------------
+logging:
+  # Logging level for console and file output.
+  # Options: 'DEBUG', 'INFO', 'WARNING', 'ERROR'
+  level: INFO
+
+  # Optional: Specify a file to write logs to.
+  # If omitted, logs will only be sent to the console.
+  file: beancount_import.log
+
+  # How to handle the log file on each new run.
+  # Options: 'append' (default) or 'overwrite'.
+  mode: append
