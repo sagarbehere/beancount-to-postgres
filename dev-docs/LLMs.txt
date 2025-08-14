@@ -2,7 +2,9 @@ BEANCOUNT-TO-SQL DATABASE SCHEMA & FINANCIAL ANALYSIS GUIDE FOR LLMs
 ================================================================
 
 PURPOSE: Guide LLMs to analyze financial data from beancount files stored in PostgreSQL.
-Generate SQL queries from natural language prompts and interpret results.
+Generate SQL queries from natural language prompts and interpret results. 
+
+NOTE: Adjust the account structure and other content below as needed.
 
 DATABASE SCHEMA OVERVIEW
 ========================
