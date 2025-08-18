@@ -394,24 +394,188 @@ def derive_account_type(account_name: str) -> str:
     return account_name
 
 
-def get_or_create_id(cur: psycopg2.extensions.cursor, cache: Dict[str, int], table: str, column: str, value: str) -> int:
-    """Get the ID for a value from a cache or the DB, creating it if it doesn't exist."""
+def preload_caches(cur: psycopg2.extensions.cursor) -> Dict[str, Dict[str, int]]:
+    """
+    Pre-populate caches with all existing entities from database.
+    This eliminates thousands of SELECT queries during import.
+    
+    Returns:
+        Dictionary of caches: {
+            'commodities': {name: id},
+            'accounts': {name: id},
+            'tags': {name: id},
+            'links': {name: id}
+        }
+    """
+    caches = {}
+    
+    # Load all commodities (typically <100 rows)
+    cur.execute("SELECT id, name FROM commodities")
+    caches['commodities'] = {row[1]: row[0] for row in cur.fetchall()}
+    logging.debug(f"Pre-loaded {len(caches['commodities'])} commodities into cache")
+    
+    # Load all accounts (typically <1000 rows)
+    cur.execute("SELECT id, name FROM accounts")
+    caches['accounts'] = {row[1]: row[0] for row in cur.fetchall()}
+    logging.debug(f"Pre-loaded {len(caches['accounts'])} accounts into cache")
+    
+    # Load all tags (typically <100 rows)
+    cur.execute("SELECT id, name FROM tags")
+    caches['tags'] = {row[1]: row[0] for row in cur.fetchall()}
+    logging.debug(f"Pre-loaded {len(caches['tags'])} tags into cache")
+    
+    # Load all links (typically <100 rows)
+    cur.execute("SELECT id, name FROM links")
+    caches['links'] = {row[1]: row[0] for row in cur.fetchall()}
+    logging.debug(f"Pre-loaded {len(caches['links'])} links into cache")
+    
+    return caches
+
+
+def get_or_create_single(cur: psycopg2.extensions.cursor,
+                        cache: Dict[str, int],
+                        table: str,
+                        column: str,
+                        value: str) -> int:
+    """
+    Optimized single-item get-or-create using INSERT...ON CONFLICT.
+    Eliminates the SELECT-before-INSERT anti-pattern.
+    
+    Args:
+        cur: Database cursor
+        cache: Cache dictionary to check and update
+        table: Table name (must be from whitelist for safety)
+        column: Column name
+        value: Value to get or create
+        
+    Returns:
+        ID of the row (existing or newly created)
+    """
+    # Check cache first
     if value in cache:
         return cache[value]
     
-    # Try to find existing record
-    cur.execute(f"SELECT id FROM {table} WHERE {column} = %s", (value,))
-    result = cur.fetchone()
-    if result:
-        cache[value] = result[0]
-        return result[0]
+    # Security: Validate table name against whitelist
+    if table not in ['commodities', 'accounts', 'tags', 'links']:
+        raise ValueError(f"Invalid table name: {table}")
     
-    # Create new record
-    cur.execute(f"INSERT INTO {table} ({column}) VALUES (%s) RETURNING id", (value,))
-    new_id = cur.fetchone()[0]
-    cache[value] = new_id
-    logging.debug(f"Created new entry in '{table}' for '{value}' with ID {new_id}")
-    return new_id
+    # Use psycopg2's safe SQL composition
+    from psycopg2 import sql
+    
+    # Single query handles both INSERT and SELECT cases
+    query = sql.SQL("""
+        INSERT INTO {table} ({column})
+        VALUES (%s)
+        ON CONFLICT ({column}) DO UPDATE
+        SET {column} = EXCLUDED.{column}  -- No-op update to return existing row
+        RETURNING id
+    """).format(
+        table=sql.Identifier(table),
+        column=sql.Identifier(column)
+    )
+    
+    cur.execute(query, (value,))
+    row_id = cur.fetchone()[0]
+    
+    # CRITICAL: Update cache after successful database operation
+    cache[value] = row_id
+    return row_id
+
+
+def get_or_create_batch(cur: psycopg2.extensions.cursor, 
+                       cache: Dict[str, int], 
+                       table: str, 
+                       column: str, 
+                       values: List[str]) -> Dict[str, int]:
+    """
+    TRUE batch get-or-create operation for multiple values.
+    Uses INSERT...ON CONFLICT with execute_values for maximum efficiency.
+    
+    Args:
+        cur: Database cursor
+        cache: Cache dictionary to check and update
+        table: Table name (must be from whitelist for safety)
+        column: Column name
+        values: List of values to get or create
+        
+    Returns:
+        Dictionary mapping values to their IDs
+    """
+    # Security: Validate table name against whitelist
+    if table not in ['commodities', 'accounts', 'tags', 'links']:
+        raise ValueError(f"Invalid table name: {table}")
+    
+    # Deduplicate and filter to only uncached values
+    unique_values = set(values)
+    uncached_values = [v for v in unique_values if v not in cache]
+    
+    if not uncached_values:
+        return {v: cache[v] for v in values}
+    
+    # Use psycopg2's safe SQL composition and execute_values for TRUE batching
+    from psycopg2 import sql
+    from psycopg2.extras import execute_values
+    
+    # Prepare the query with proper escaping
+    query = sql.SQL("""
+        INSERT INTO {table} ({column})
+        VALUES %s
+        ON CONFLICT ({column}) DO UPDATE
+        SET {column} = EXCLUDED.{column}  -- No-op update to return existing row
+        RETURNING id, {column}
+    """).format(
+        table=sql.Identifier(table),
+        column=sql.Identifier(column)
+    )
+    
+    # Execute batch insert and fetch all results at once
+    results = execute_values(
+        cur,
+        query.as_string(cur),  # Convert SQL composition to string
+        [(v,) for v in uncached_values],
+        fetch=True
+    )
+    
+    # CRITICAL: Update cache with all results atomically
+    for row_id, name_val in results:
+        cache[name_val] = row_id
+    
+    # Return complete mapping for all requested values
+    return {v: cache[v] for v in values}
+
+
+def create_transaction_scoped_cache(global_cache: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, int]]:
+    """
+    Create a transaction-scoped cache that inherits from global cache.
+    This ensures cache consistency on rollback.
+    """
+    return {
+        'commodities': global_cache.get('commodities', {}).copy(),
+        'accounts': global_cache.get('accounts', {}).copy(),
+        'tags': global_cache.get('tags', {}).copy(),
+        'links': global_cache.get('links', {}).copy()
+    }
+
+
+def safe_cache_update(global_cache: Dict[str, Dict[str, int]], 
+                     local_cache: Dict[str, Dict[str, int]]) -> None:
+    """
+    Safely update global cache after successful commit.
+    Only call this AFTER conn.commit() succeeds.
+    """
+    for cache_type in ['commodities', 'accounts', 'tags', 'links']:
+        if cache_type in local_cache:
+            global_cache[cache_type].update(local_cache[cache_type])
+
+
+def get_or_create_id(cur: psycopg2.extensions.cursor, cache: Dict[str, int], table: str, column: str, value: str) -> int:
+    """Get the ID for a value from a cache or the DB, creating it if it doesn't exist.
+    
+    DEPRECATED: This function uses the SELECT-before-INSERT anti-pattern.
+    Use get_or_create_single() or get_or_create_batch() instead.
+    """
+    # Use the optimized version
+    return get_or_create_single(cur, cache, table, column, value)
 
 
 def process_commodities(cur: psycopg2.extensions.cursor, entries: List[data.Directive], commodity_cache: Dict[str, int], dry_run: bool) -> None:
@@ -899,7 +1063,18 @@ def process_transaction_chunk(cur: psycopg2.extensions.cursor, chunk: List[data.
                             """, (txn_id, key, str(value)))
             
             # Process postings (same logic as before but for this transaction only)
-            for posting in entry.postings:
+            for posting_idx, posting in enumerate(entry.postings):
+                # Validate posting has required data
+                if posting.units is None:
+                    raise ValueError(f"Posting {posting_idx + 1} in transaction at {transaction_context} has no units/amount. "
+                                   f"Transaction: '{entry.narration}', Account: '{posting.account}'. "
+                                   f"All postings must have an amount unless they are balance-clearing postings.")
+                
+                if posting.units.number is None:
+                    raise ValueError(f"Posting {posting_idx + 1} in transaction at {transaction_context} has null amount. "
+                                   f"Transaction: '{entry.narration}', Account: '{posting.account}', "
+                                   f"Currency: '{posting.units.currency}'. All postings must have a numeric amount.")
+                
                 # Ensure account exists
                 account_id = caches['accounts'].get(posting.account)
                 if account_id is None:
@@ -1023,6 +1198,500 @@ def process_transaction_chunk(cur: psycopg2.extensions.cursor, chunk: List[data.
     return processed_count, skipped_count
 
 
+def process_transaction_chunk_optimized(cur: psycopg2.extensions.cursor, 
+                                       chunk: List[data.Transaction],
+                                       caches: Dict[str, Dict[str, int]], 
+                                       id_generator: TransactionIdGenerator,
+                                       config: Dict[str, Any], 
+                                       dry_run: bool, 
+                                       resume_mode: bool,
+                                       chunk_info: Tuple[int, int, int, int]) -> Tuple[int, int]:
+    """
+    Optimized transaction chunk processing using batch operations.
+    Reduces database round-trips by 10-100x.
+    """
+    from psycopg2.extras import execute_values
+    
+    chunk_num, total_chunks, start_idx, end_idx = chunk_info
+    on_duplicate = 'skip' if resume_mode else config.get('import_settings', {}).get('on_duplicate', 'skip')
+    
+    logging.info(f"Processing chunk {chunk_num}/{total_chunks} (transactions {start_idx}-{end_idx})")
+    
+    if dry_run:
+        # Dry run logic remains the same
+        return process_transaction_chunk(cur, chunk, caches, id_generator, 
+                                       config, dry_run, resume_mode, chunk_info)
+    
+    # Step 1: Collect all unique entities needed for this chunk
+    all_commodities = set()
+    all_accounts = set()
+    all_tags = set()
+    all_links = set()
+    
+    # First pass: collect all entities
+    for txn in chunk:
+        # Collect from postings
+        for posting in txn.postings:
+            all_accounts.add(posting.account)
+            if posting.units:
+                all_commodities.add(posting.units.currency)
+            if posting.cost and posting.cost.currency:
+                all_commodities.add(posting.cost.currency)
+            if posting.price and posting.price.currency:
+                all_commodities.add(posting.price.currency)
+        
+        # Collect tags and links
+        if txn.tags:
+            all_tags.update(txn.tags)
+        if txn.links:
+            all_links.update(txn.links)
+    
+    # Step 2: Batch create all entities and update caches
+    try:
+        if all_commodities:
+            get_or_create_batch(cur, caches['commodities'], 'commodities', 'name', list(all_commodities))
+        
+        if all_accounts:
+            # For accounts, we need special handling due to the type field
+            uncached_accounts = [a for a in all_accounts if a not in caches['accounts']]
+            if uncached_accounts:
+                try:
+                    # Prepare account data with types
+                    account_data = [(acc, derive_account_type(acc), 'open') for acc in uncached_accounts]
+                    
+                    # Batch insert with ON CONFLICT
+                    results = execute_values(
+                        cur,
+                        """
+                        INSERT INTO accounts (name, type, status)
+                        VALUES %s
+                        ON CONFLICT (name) DO UPDATE 
+                        SET name = EXCLUDED.name  -- No-op to return existing
+                        RETURNING id, name
+                        """,
+                        account_data,
+                        fetch=True
+                    )
+                    
+                    # Update cache
+                    for acc_id, acc_name in results:
+                        caches['accounts'][acc_name] = acc_id
+                except Exception as e:
+                    logging.error(f"Failed to create {len(uncached_accounts)} accounts for chunk {chunk_num}")
+                    logging.error(f"Accounts being created: {', '.join(uncached_accounts[:10])}")
+                    if len(uncached_accounts) > 10:
+                        logging.error(f"... and {len(uncached_accounts) - 10} more accounts")
+                    
+                    # Show which transactions need these accounts
+                    affected_transactions = []
+                    for txn in chunk:
+                        source_file = txn.meta.get('filename', 'unknown')
+                        source_line = txn.meta.get('lineno', 'unknown')
+                        txn_accounts = {posting.account for posting in txn.postings}
+                        problematic_accounts = txn_accounts.intersection(set(uncached_accounts))
+                        if problematic_accounts:
+                            affected_transactions.append(f"  - {source_file}:{source_line} '{txn.narration}' uses accounts: {', '.join(problematic_accounts)}")
+                    
+                    if affected_transactions:
+                        logging.error("Transactions using these accounts:")
+                        for txn_info in affected_transactions[:5]:
+                            logging.error(txn_info)
+                    
+                    raise ValueError(f"Account creation failed in chunk {chunk_num}: {e}") from e
+        
+        if all_tags:
+            get_or_create_batch(cur, caches['tags'], 'tags', 'name', list(all_tags))
+        
+        if all_links:
+            get_or_create_batch(cur, caches['links'], 'links', 'name', list(all_links))
+            
+    except Exception as e:
+        if "Account creation failed" not in str(e):  # Don't double-wrap our own errors
+            logging.error(f"Failed to create entities for chunk {chunk_num}")
+            # Show transactions being processed
+            affected_transactions = []
+            for txn in chunk:
+                source_file = txn.meta.get('filename', 'unknown')
+                source_line = txn.meta.get('lineno', 'unknown')
+                affected_transactions.append(f"  - {source_file}:{source_line} '{txn.narration}'")
+            
+            if affected_transactions:
+                logging.error("Transactions being processed when entity creation failed:")
+                for txn_info in affected_transactions[:10]:
+                    logging.error(txn_info)
+                if len(affected_transactions) > 10:
+                    logging.error(f"  ... and {len(affected_transactions) - 10} more transactions")
+        
+        raise
+    
+    # Step 3: Generate external IDs and check for duplicates
+    transactions_with_ids = []
+    external_ids = []
+    
+    for txn in chunk:
+        txn_with_id = add_transaction_id_to_beancount_transaction(
+            transaction=txn,
+            force_recalculate=False,
+            strict_validation=False,
+            id_generator=id_generator
+        )
+        transactions_with_ids.append(txn_with_id)
+        external_ids.append(txn_with_id.meta['transaction_id'])
+    
+    # Batch check for existing transactions
+    existing_ids = set()
+    if external_ids:
+        cur.execute("""
+            SELECT external_id FROM transactions 
+            WHERE external_id = ANY(%s)
+        """, (external_ids,))
+        existing_ids = {row[0] for row in cur.fetchall()}
+    
+    # Step 4: Prepare batch data for insertions
+    transactions_to_insert = []
+    transaction_external_ids = []  # Keep track of which transactions we're inserting
+    
+    processed_count = 0
+    skipped_count = 0
+    
+    for txn in transactions_with_ids:
+        external_id = txn.meta['transaction_id']
+        
+        # Skip if duplicate
+        if external_id in existing_ids and on_duplicate == 'skip':
+            skipped_count += 1
+            logging.debug(f"Skipping duplicate transaction: {external_id}")
+            continue
+        
+        # Prepare transaction data
+        transactions_to_insert.append((
+            external_id,
+            txn.date,
+            txn.flag,
+            txn.payee,
+            txn.narration,
+            txn.meta.get('filename'),
+            txn.meta.get('lineno')
+        ))
+        transaction_external_ids.append(external_id)
+        processed_count += 1
+    
+    # Step 5: Batch insert transactions and get their IDs
+    txn_id_map = {}
+    if transactions_to_insert:
+        try:
+            transaction_ids = execute_values(
+                cur,
+                """
+                INSERT INTO transactions (external_id, date, flag, payee, narration, source_file, source_line)
+                VALUES %s
+                RETURNING id, external_id
+                """,
+                transactions_to_insert,
+                fetch=True
+            )
+            
+            # Map external_id to internal id
+            txn_id_map = {row[1]: row[0] for row in transaction_ids}
+        except Exception as e:
+            # Enhanced error reporting for transaction insert failures
+            logging.error(f"Failed to insert {len(transactions_to_insert)} transactions for chunk {chunk_num}")
+            
+            # Create a mapping from external_id to transaction details for error reporting
+            external_id_to_txn = {txn.meta['transaction_id']: txn for txn in transactions_with_ids}
+            
+            # If it's a duplicate key error, try to identify the specific transaction
+            if "duplicate key value violates unique constraint" in str(e) and "external_id" in str(e):
+                import re
+                # Extract the external_id from the error message
+                match = re.search(r'\(external_id\)=\(([a-f0-9]+)\)', str(e))
+                if match:
+                    duplicate_external_id = match.group(1)
+                    if duplicate_external_id in external_id_to_txn:
+                        txn = external_id_to_txn[duplicate_external_id]
+                        source_file = txn.meta.get('filename', 'unknown')
+                        source_line = txn.meta.get('lineno', 'unknown')
+                        logging.error(f"DUPLICATE TRANSACTION: {source_file}:{source_line}")
+                        logging.error(f"  Transaction: '{txn.narration}'")
+                        logging.error(f"  Date: {txn.date}")
+                        logging.error(f"  External ID: {duplicate_external_id}")
+                        logging.error(f"This transaction appears to be a duplicate of one already in the database.")
+            
+            # Show all transactions being processed in this batch
+            logging.error("All transactions being processed in this batch:")
+            for i, (external_id, date, flag, payee, narration, source_file, source_line) in enumerate(transactions_to_insert[:10]):
+                logging.error(f"  {i+1}. {source_file or 'unknown'}:{source_line or 'unknown'} '{narration}' ({date})")
+            if len(transactions_to_insert) > 10:
+                logging.error(f"  ... and {len(transactions_to_insert) - 10} more transactions")
+            
+            raise ValueError(f"Transaction insert failed in chunk {chunk_num}: {e}") from e
+    
+    # Step 6: Prepare and batch insert related data
+    if txn_id_map:
+        postings_to_insert = []
+        transaction_tags_to_insert = []
+        transaction_links_to_insert = []
+        transaction_metadata_to_insert = []
+        posting_metadata_by_posting = []  # Track metadata for each posting
+        
+        for txn in transactions_with_ids:
+            external_id = txn.meta['transaction_id']
+            
+            if external_id not in txn_id_map:
+                continue  # Was skipped
+            
+            txn_id = txn_id_map[external_id]
+            
+            # Prepare postings
+            for posting_idx, posting in enumerate(txn.postings):
+                # Get transaction context for error reporting
+                source_file = txn.meta.get('filename', 'unknown')
+                source_line = txn.meta.get('lineno', 'unknown')
+                transaction_context = f"{source_file}:{source_line}"
+                
+                # Validate posting has required data
+                if posting.units is None:
+                    raise ValueError(f"Posting {posting_idx + 1} in transaction at {transaction_context} has no units/amount. "
+                                   f"Transaction: '{txn.narration}', Account: '{posting.account}'. "
+                                   f"All postings must have an amount unless they are balance-clearing postings.")
+                
+                if posting.units.number is None:
+                    raise ValueError(f"Posting {posting_idx + 1} in transaction at {transaction_context} has null amount. "
+                                   f"Transaction: '{txn.narration}', Account: '{posting.account}', "
+                                   f"Currency: '{posting.units.currency}'. All postings must have a numeric amount.")
+                
+                try:
+                    account_id = caches['accounts'][posting.account]
+                except KeyError:
+                    raise ValueError(f"Account '{posting.account}' not found in cache for posting {posting_idx + 1} "
+                                   f"in transaction at {transaction_context}. Transaction: '{txn.narration}'")
+                
+                try:
+                    currency_id = caches['commodities'][posting.units.currency]
+                except KeyError:
+                    raise ValueError(f"Currency '{posting.units.currency}' not found in cache for posting {posting_idx + 1} "
+                                   f"in transaction at {transaction_context}. Transaction: '{txn.narration}'")
+                
+                cost_amount = posting.cost.number if posting.cost else None
+                cost_currency_id = caches['commodities'].get(posting.cost.currency) if posting.cost and posting.cost.currency else None
+                price_amount = posting.price.number if posting.price else None
+                price_currency_id = caches['commodities'].get(posting.price.currency) if posting.price and posting.price.currency else None
+                
+                postings_to_insert.append((
+                    txn_id,
+                    posting.flag,
+                    account_id,
+                    posting.units.number,  # Now guaranteed to be non-None
+                    currency_id,
+                    cost_amount,
+                    cost_currency_id,
+                    price_amount,
+                    price_currency_id
+                ))
+                
+                # Track posting metadata for later processing
+                if posting.meta:
+                    posting_metadata_by_posting.append((len(postings_to_insert) - 1, posting.meta))
+            
+            # Prepare tags
+            if txn.tags:
+                for tag in txn.tags:
+                    tag_id = caches['tags'][tag]
+                    transaction_tags_to_insert.append((txn_id, tag_id))
+            
+            # Prepare links
+            if txn.links:
+                for link in txn.links:
+                    link_id = caches['links'][link]
+                    transaction_links_to_insert.append((txn_id, link_id))
+            
+            # Prepare metadata
+            if txn.meta:
+                for key, value in txn.meta.items():
+                    if key not in RESERVED_METADATA_KEYS:
+                        transaction_metadata_to_insert.append((txn_id, key, str(value)))
+        
+        # Batch insert postings
+        posting_ids = []
+        if postings_to_insert:
+            try:
+                posting_results = execute_values(
+                    cur,
+                    """
+                    INSERT INTO postings 
+                    (transaction_id, flag, account_id, amount, currency_id, 
+                     cost_amount, cost_currency_id, price_amount, price_currency_id)
+                    VALUES %s
+                    RETURNING id
+                    """,
+                    postings_to_insert,
+                    fetch=True
+                )
+                posting_ids = [row[0] for row in posting_results]
+            except Exception as e:
+                # Enhanced error reporting for posting insert failures
+                logging.error(f"Failed to insert {len(postings_to_insert)} postings for chunk {chunk_num}")
+                
+                # Find which transactions were being processed
+                affected_transactions = []
+                for txn in transactions_with_ids:
+                    external_id = txn.meta['transaction_id']
+                    if external_id in txn_id_map:
+                        source_file = txn.meta.get('filename', 'unknown')
+                        source_line = txn.meta.get('lineno', 'unknown')
+                        affected_transactions.append(f"  - {source_file}:{source_line} '{txn.narration}'")
+                
+                if affected_transactions:
+                    logging.error("Transactions being processed when error occurred:")
+                    for txn_info in affected_transactions[:10]:  # Show first 10
+                        logging.error(txn_info)
+                    if len(affected_transactions) > 10:
+                        logging.error(f"  ... and {len(affected_transactions) - 10} more transactions")
+                
+                # Log sample of data being inserted for debugging
+                if postings_to_insert:
+                    logging.error("Sample posting data being inserted:")
+                    for i, posting_data in enumerate(postings_to_insert[:3]):  # Show first 3
+                        logging.error(f"  Posting {i + 1}: {posting_data}")
+                    if len(postings_to_insert) > 3:
+                        logging.error(f"  ... and {len(postings_to_insert) - 3} more postings")
+                
+                raise ValueError(f"Posting insert failed in chunk {chunk_num}: {e}") from e
+        
+        # Batch insert posting metadata
+        if posting_metadata_by_posting and posting_ids:
+            posting_metadata_to_insert = []
+            for posting_idx, metadata in posting_metadata_by_posting:
+                posting_id = posting_ids[posting_idx]
+                for key, value in metadata.items():
+                    if key not in RESERVED_METADATA_KEYS:
+                        posting_metadata_to_insert.append((posting_id, key, str(value)))
+            
+            if posting_metadata_to_insert:
+                try:
+                    execute_values(
+                        cur,
+                        """
+                        INSERT INTO posting_metadata (posting_id, key, value)
+                        VALUES %s
+                        ON CONFLICT (posting_id, key) DO UPDATE SET value = EXCLUDED.value
+                        """,
+                        posting_metadata_to_insert
+                    )
+                except Exception as e:
+                    logging.error(f"Failed to insert {len(posting_metadata_to_insert)} posting metadata records for chunk {chunk_num}")
+                    # Show affected transactions and postings
+                    affected_info = []
+                    for txn in transactions_with_ids:
+                        if txn.meta['transaction_id'] in txn_id_map:
+                            source_file = txn.meta.get('filename', 'unknown')
+                            source_line = txn.meta.get('lineno', 'unknown')
+                            for posting_idx, posting in enumerate(txn.postings):
+                                if posting.meta:
+                                    meta_keys = [k for k in posting.meta.keys() if k not in RESERVED_METADATA_KEYS]
+                                    if meta_keys:
+                                        affected_info.append(f"  - {source_file}:{source_line} '{txn.narration}' posting {posting_idx+1} ({posting.account}) metadata: {', '.join(meta_keys)}")
+                    
+                    if affected_info:
+                        logging.error("Postings with metadata being processed when error occurred:")
+                        for info in affected_info[:5]:
+                            logging.error(info)
+                    
+                    raise ValueError(f"Posting metadata insert failed in chunk {chunk_num}: {e}") from e
+        
+        # Batch insert transaction tags
+        if transaction_tags_to_insert:
+            try:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO transaction_tags (transaction_id, tag_id)
+                    VALUES %s
+                    ON CONFLICT DO NOTHING
+                    """,
+                    transaction_tags_to_insert
+                )
+            except Exception as e:
+                logging.error(f"Failed to insert {len(transaction_tags_to_insert)} transaction tags for chunk {chunk_num}")
+                # Show affected transactions
+                affected_transactions = []
+                for txn in transactions_with_ids:
+                    if txn.meta['transaction_id'] in txn_id_map and txn.tags:
+                        source_file = txn.meta.get('filename', 'unknown')
+                        source_line = txn.meta.get('lineno', 'unknown')
+                        affected_transactions.append(f"  - {source_file}:{source_line} '{txn.narration}' (tags: {', '.join(txn.tags)})")
+                
+                if affected_transactions:
+                    logging.error("Transactions with tags being processed when error occurred:")
+                    for txn_info in affected_transactions[:5]:
+                        logging.error(txn_info)
+                
+                raise ValueError(f"Transaction tags insert failed in chunk {chunk_num}: {e}") from e
+        
+        # Batch insert transaction links
+        if transaction_links_to_insert:
+            try:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO transaction_links (transaction_id, link_id)
+                    VALUES %s
+                    ON CONFLICT DO NOTHING
+                    """,
+                    transaction_links_to_insert
+                )
+            except Exception as e:
+                logging.error(f"Failed to insert {len(transaction_links_to_insert)} transaction links for chunk {chunk_num}")
+                # Show affected transactions
+                affected_transactions = []
+                for txn in transactions_with_ids:
+                    if txn.meta['transaction_id'] in txn_id_map and txn.links:
+                        source_file = txn.meta.get('filename', 'unknown')
+                        source_line = txn.meta.get('lineno', 'unknown')
+                        affected_transactions.append(f"  - {source_file}:{source_line} '{txn.narration}' (links: {', '.join(txn.links)})")
+                
+                if affected_transactions:
+                    logging.error("Transactions with links being processed when error occurred:")
+                    for txn_info in affected_transactions[:5]:
+                        logging.error(txn_info)
+                
+                raise ValueError(f"Transaction links insert failed in chunk {chunk_num}: {e}") from e
+        
+        # Batch insert transaction metadata
+        if transaction_metadata_to_insert:
+            try:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO transaction_metadata (transaction_id, key, value)
+                    VALUES %s
+                    ON CONFLICT (transaction_id, key) DO UPDATE SET value = EXCLUDED.value
+                    """,
+                    transaction_metadata_to_insert
+                )
+            except Exception as e:
+                logging.error(f"Failed to insert {len(transaction_metadata_to_insert)} transaction metadata records for chunk {chunk_num}")
+                # Show affected transactions
+                affected_transactions = []
+                for txn in transactions_with_ids:
+                    if txn.meta['transaction_id'] in txn_id_map:
+                        meta_keys = [k for k in txn.meta.keys() if k not in RESERVED_METADATA_KEYS]
+                        if meta_keys:
+                            source_file = txn.meta.get('filename', 'unknown')
+                            source_line = txn.meta.get('lineno', 'unknown')
+                            affected_transactions.append(f"  - {source_file}:{source_line} '{txn.narration}' (metadata keys: {', '.join(meta_keys)})")
+                
+                if affected_transactions:
+                    logging.error("Transactions with metadata being processed when error occurred:")
+                    for txn_info in affected_transactions[:5]:
+                        logging.error(txn_info)
+                
+                raise ValueError(f"Transaction metadata insert failed in chunk {chunk_num}: {e}") from e
+    
+    logging.info(f"Chunk {chunk_num} completed: {processed_count} processed, {skipped_count} skipped")
+    return processed_count, skipped_count
+
+
 def process_and_import(conn: psycopg2.extensions.connection, file_paths: List[str], 
                       id_generator: TransactionIdGenerator, config: Dict[str, Any], 
                       dry_run: bool, resume_mode: bool) -> None:
@@ -1084,22 +1753,23 @@ def process_and_import(conn: psycopg2.extensions.connection, file_paths: List[st
         logging.info(f"Found {len(commodity_entries)} commodities, {len(account_entries)} accounts, "
                     f"{len(transaction_entries)} transactions, {len(other_entries)} other directives")
         
-        # Initialize caches for foreign key IDs
-        caches = {
-            'accounts': {},
-            'commodities': {},
-            'tags': {},
-            'links': {}
-        }
+        # Initialize global caches with pre-population
+        with conn.cursor() as cur:
+            global_caches = preload_caches(cur)
+            logging.info(f"Pre-loaded caches: {len(global_caches['commodities'])} commodities, "
+                        f"{len(global_caches['accounts'])} accounts, "
+                        f"{len(global_caches['tags'])} tags, "
+                        f"{len(global_caches['links'])} links")
         
         # PHASE 1: Schema Operations (Single Transaction)
         logging.info("Phase 1: Processing schema operations (commodities and accounts)...")
         with conn.cursor() as cur:
+            # Use global caches for Phase 1
             logging.info("Processing commodities...")
-            process_commodities(cur, commodity_entries, caches['commodities'], dry_run)
+            process_commodities(cur, commodity_entries, global_caches['commodities'], dry_run)
             
             logging.info("Processing accounts...")
-            process_accounts(cur, account_entries, caches['accounts'], dry_run)
+            process_accounts(cur, account_entries, global_caches['accounts'], dry_run)
         
         if not dry_run:
             conn.commit()
@@ -1123,18 +1793,31 @@ def process_and_import(conn: psycopg2.extensions.connection, file_paths: List[st
                 end_idx = min(start_idx + len(chunk) - 1, len(transaction_entries))
                 chunk_info = (chunk_num, total_chunks, start_idx, end_idx)
                 
-                with conn.cursor() as cur:
-                    processed, skipped = process_transaction_chunk(
-                        cur, chunk, caches, id_generator, config, dry_run, resume_mode, chunk_info
-                    )
-                    total_processed += processed
-                    total_skipped += skipped
+                # Create transaction-scoped cache for this chunk
+                local_caches = create_transaction_scoped_cache(global_caches)
                 
-                if not dry_run:
-                    conn.commit()
-                    logging.debug(f"Chunk {chunk_num} committed to database")
-                else:
-                    logging.debug(f"[DRY RUN] Chunk {chunk_num} completed (would be committed)")
+                try:
+                    with conn.cursor() as cur:
+                        # Use optimized batch processing
+                        processed, skipped = process_transaction_chunk_optimized(
+                            cur, chunk, local_caches, id_generator, config, dry_run, resume_mode, chunk_info
+                        )
+                        total_processed += processed
+                        total_skipped += skipped
+                    
+                    if not dry_run:
+                        conn.commit()
+                        # Update global cache only after successful commit
+                        safe_cache_update(global_caches, local_caches)
+                        logging.debug(f"Chunk {chunk_num} committed to database")
+                    else:
+                        logging.debug(f"[DRY RUN] Chunk {chunk_num} completed (would be committed)")
+                        
+                except Exception as e:
+                    # Rollback on error - local_caches discarded
+                    conn.rollback()
+                    logging.error(f"Chunk {chunk_num} failed: {e}")
+                    raise
             
             logging.info(f"Phase 2 completed: {total_processed} transactions processed, {total_skipped} skipped")
         else:
@@ -1145,7 +1828,7 @@ def process_and_import(conn: psycopg2.extensions.connection, file_paths: List[st
         with conn.cursor() as cur:
             if other_entries:
                 logging.info("Processing other directives...")
-                process_other_directives(cur, other_entries, caches, dry_run)
+                process_other_directives(cur, other_entries, global_caches, dry_run)
             
             # Update import state hash
             if not dry_run:
